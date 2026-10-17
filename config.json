@@ -1,0 +1,17 @@
+{
+  "comment": "Endpoints are tried in order; the first max_endpoints that complete the WebSocket handshake are used. stream.binance.com is geo-blocked (HTTP 451) in some regions and is then skipped; listing data-stream.binance.vision twice still yields two independent connections for feed redundancy / de-dup.",
+  "endpoints": [
+    "wss://data-stream.binance.vision/stream",
+    "wss://stream.binance.com:9443/stream",
+    "wss://data-stream.binance.vision/stream"
+  ],
+  "max_endpoints": 2,
+  "symbols": ["btcusdt", "ethusdt"],
+  "duration_s": 60,
+  "out": "data/market_data.l2bin",
+  "raw_out": "",
+  "queue_capacity": 65536,
+  "ping_interval_ms": 1000,
+  "connect_timeout_s": 10,
+  "stale_after_ms": 5000
+}
