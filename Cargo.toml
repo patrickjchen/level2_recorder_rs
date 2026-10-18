@@ -16,6 +16,10 @@ path = "src/bin/l2_recorder.rs"
 name = "l2_dump"
 path = "src/bin/l2_dump.rs"
 
+[[bin]]
+name = "l2_to_csv"
+path = "src/bin/l2_to_csv.rs"
+
 [dependencies]
 rtrb          = "0.4"
 tungstenite   = { version = "0.30", features = ["rustls-tls-native-roots"] }

@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod dedup;
+pub mod l2bin;
 pub mod parse_stage;
 pub mod parser;
 pub mod persist;

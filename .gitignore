@@ -1,3 +1,4 @@
 target/
 data/*.l2bin
 data/*.jsonl
+data/*.csv

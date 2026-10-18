@@ -92,9 +92,10 @@ File: FileHeader (32 B: "L2BIN\0\0\0", version, record size, n_symbols, name len
       · n_symbols × 16 B NUL-padded names · records
 ```
 
-`l2_dump FILE` prints CSV
+`l2_dump FILE` prints CSV on stdout
 (`symbol,exch_ts_ms,recv_ts_us,latency_us,endpoint,seq,type,side,price,quantity`);
-`--header-only` shows the symbol table.
+`--header-only` shows the symbol table. `l2_to_csv IN.l2bin [OUT.csv]` writes
+the same CSV to a file (default: `IN` with `.l2bin` replaced by `.csv`).
 
 ## Config
 
@@ -131,12 +132,13 @@ cargo test --release           # fixed-point + parser unit tests
 
 ./target/release/l2_recorder   # uses ./config.json
 ./target/release/l2_dump data/market_data.l2bin | head
+./target/release/l2_to_csv data/market_data.l2bin        # -> data/market_data.csv
 ```
 
 ## Files
 
 ```
-Cargo.toml                 lib + bins l2_recorder, l2_dump
+Cargo.toml                 lib + bins l2_recorder, l2_dump, l2_to_csv
 config.json
 src/lib.rs
 src/config.rs              Config (serde) + stream URL builder
@@ -148,8 +150,10 @@ src/ws_client.rs           tungstenite + rustls wrapper, PING/PONG RTT
 src/reader.rs              reader thread (one per feed)
 src/parser.rs              sonic-rs structs -> ParsedMsg
 src/dedup.rs               sequence-number feed arbitration
+src/l2bin.rs               .l2bin reader + CSV writer (shared by l2_dump / l2_to_csv)
 src/parse_stage.rs         parser thread (merges reader queues)
 src/persist.rs             persister thread
 src/bin/l2_recorder.rs     CLI, connect, threads, summary
-src/bin/l2_dump.rs         .l2bin -> CSV
+src/bin/l2_dump.rs         .l2bin -> CSV on stdout
+src/bin/l2_to_csv.rs       .l2bin -> .csv file
 ```
