@@ -1,6 +1,7 @@
 # l2_recorder (Rust)
 
-Rust port of `Extra/l2_recorder` (branch `multi-reader`): a multi-threaded
+Lives at `Extra/level2_recorder_rs`. Rust port of `Extra/l2_recorder` (branch
+`multi-reader`): a multi-threaded
 recorder for Binance L2 market data (trades + `depth@100ms` diffs). Streams
 from one or two redundant WebSocket feeds, de-duplicates across them by
 sequence number, converts to a fixed-size binary record, and persists. The
