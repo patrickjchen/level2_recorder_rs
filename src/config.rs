@@ -13,6 +13,7 @@ pub struct Config {
     pub endpoints: Vec<String>,
     pub max_endpoints: usize,
     pub symbols: Vec<String>,
+    /// 0 => run until SIGINT/SIGTERM.
     pub duration_s: u64,
     pub out: String,
     /// Empty => raw dump disabled.
@@ -29,6 +30,28 @@ pub struct Config {
     /// CPU ids for [reader0, reader1, ..., parser, persist]; -1 or missing =
     /// unpinned.
     pub pin_cpus: Vec<i32>,
+    /// Proactively replace each connection after this long (Binance closes
+    /// every stream at the 24 h mark). Make-before-break: the new socket is
+    /// opened before the old one is dropped. 0 disables.
+    pub reconnect_after_s: u64,
+    /// Feed i rotates its connection at reconnect_after_s + i * stagger, so
+    /// redundant feeds never rotate at the same moment.
+    pub reconnect_stagger_s: u64,
+    /// Cap on the exponential back-off between failed reconnect attempts.
+    pub reconnect_backoff_max_s: u64,
+    /// Start a new output file (and raw dump) at every wall-clock boundary of
+    /// this many seconds (86400 = daily at 00:00 UTC). Files are named
+    /// `<stem>.<YYYYMMDDTHHMMSSZ>.<ext>` and never overwritten. 0 => a single
+    /// file at exactly `out` (overwritten on start; for short test runs).
+    pub rotate_s: u64,
+    /// Flush buffered records to the OS this often, bounding loss on a crash.
+    pub flush_interval_ms: u64,
+    /// Progress line period when stdout is not a terminal.
+    pub status_interval_s: u64,
+    /// Reservoir size for latency / jitter / lag percentiles. Bounds memory
+    /// on long runs: beyond this many samples the percentiles are estimated
+    /// from a uniform random sample.
+    pub max_samples: usize,
 }
 
 impl Default for Config {
@@ -46,6 +69,13 @@ impl Default for Config {
             stale_after_ms: 5000,
             reader_busy_poll: false,
             pin_cpus: Vec::new(),
+            reconnect_after_s: 23 * 3600,
+            reconnect_stagger_s: 300,
+            reconnect_backoff_max_s: 30,
+            rotate_s: 86_400,
+            flush_interval_ms: 1000,
+            status_interval_s: 30,
+            max_samples: 1 << 20,
         }
     }
 }
@@ -80,6 +110,21 @@ impl Config {
         }
         if self.queue_capacity < 16 {
             self.queue_capacity = 16;
+        }
+        if self.max_samples < 1024 {
+            self.max_samples = 1024;
+        }
+        if self.reconnect_after_s > 0 && self.reconnect_after_s < 60 {
+            return Err("config: reconnect_after_s must be 0 or >= 60".into());
+        }
+        if self.rotate_s > 0 && self.rotate_s < 60 {
+            return Err("config: rotate_s must be 0 or >= 60".into());
+        }
+        if self.reconnect_backoff_max_s < 1 {
+            self.reconnect_backoff_max_s = 1;
+        }
+        if self.status_interval_s < 1 {
+            self.status_interval_s = 1;
         }
         Ok(())
     }

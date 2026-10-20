@@ -11,6 +11,7 @@
 //! Config comes from a JSON file (default ./config.json); a few CLI flags
 //! override it. See README.md.
 
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,7 +26,8 @@ use l2_recorder::persist::{PersistResult, Persister};
 use l2_recorder::queue::{channel, QueueGauge};
 use l2_recorder::reader::{RawMsg, Reader};
 use l2_recorder::record::Record;
-use l2_recorder::stats::{percentiles, print_pcts, Live, ParseStats, ReaderStats};
+use l2_recorder::stats::{print_pcts, Live, ParseStats, ReaderStats, Reservoir};
+use l2_recorder::time::{utc_stamp, wall_us};
 use l2_recorder::ws_client::WsClient;
 
 #[derive(ClapParser)]
@@ -37,6 +39,7 @@ struct Cli {
     /// Comma-separated symbols, e.g. btcusdt,ethusdt
     #[arg(long, alias = "symbol")]
     symbols: Option<String>,
+    /// Seconds to run; 0 = until SIGINT/SIGTERM
     #[arg(long)]
     duration: Option<u64>,
     #[arg(long)]
@@ -135,17 +138,22 @@ fn run() -> i32 {
         return 1;
     }
     let n_feeds = conns.len();
+    // duration 0 (or one too large for Instant) => run until signalled.
+    let deadline = if cfg.duration_s == 0 { None } else { Instant::now().checked_add(Duration::from_secs(cfg.duration_s)) };
     println!(
-        "recording {} symbol(s) on {} feed(s) for {} s -> {}",
+        "recording {} symbol(s) on {} feed(s) {} -> {}{}",
         cfg.symbols.len(),
         n_feeds,
-        cfg.duration_s,
-        cfg.out
+        match deadline {
+            Some(_) => format!("for {} s", cfg.duration_s),
+            None => "until stopped (SIGINT/SIGTERM)".to_string(),
+        },
+        cfg.out,
+        if cfg.rotate_s > 0 { format!(" (rotating every {} s)", cfg.rotate_s) } else { String::new() }
     );
 
     // --- Pipeline: one reader thread + one queue per feed.
     let live = Live::new(n_feeds, cfg.symbols.len());
-    let deadline = Instant::now() + Duration::from_secs(cfg.duration_s);
     let stale_after_us = cfg.stale_after_ms as i64 * 1000;
 
     let mut q1_rx = Vec::new();
@@ -165,6 +173,12 @@ fn run() -> i32 {
             ping_interval: Duration::from_millis(cfg.ping_interval_ms),
             stale_after_us,
             busy_poll: cfg.reader_busy_poll,
+            connect_timeout: Duration::from_secs(cfg.connect_timeout_s),
+            // Stagger so redundant feeds never rotate together.
+            reconnect_after: (cfg.reconnect_after_s > 0)
+                .then(|| Duration::from_secs(cfg.reconnect_after_s + i as u64 * cfg.reconnect_stagger_s)),
+            backoff_max: Duration::from_secs(cfg.reconnect_backoff_max_s),
+            max_samples: cfg.max_samples,
         });
     }
     let (q2_tx, q2_rx, q2_gauge) = channel::<Record>(cfg.queue_capacity);
@@ -183,6 +197,7 @@ fn run() -> i32 {
         running: &running,
         live: &live,
         stale_after_us,
+        max_samples: cfg.max_samples,
     };
     let persist = Persister {
         out_path: cfg.out.clone(),
@@ -192,6 +207,8 @@ fn run() -> i32 {
         raw_input: q3_rx,
         running: &running,
         live: &live,
+        rotate_s: cfg.rotate_s,
+        flush_interval: Duration::from_millis(cfg.flush_interval_ms),
     };
 
     // Thread slots for pin_cpus: [reader0..readerN-1, parser, persist].
@@ -227,24 +244,18 @@ fn run() -> i32 {
                 })
                 .collect();
 
-            // Progress line from main; the stages never touch stdout.
-            while running.load(Ordering::Relaxed) && Instant::now() < deadline {
-                let stale_feeds = live.feed_stale.iter().filter(|f| f.load(Ordering::Relaxed)).count();
-                let stale_syms = live.symbol_stale.iter().filter(|f| f.load(Ordering::Relaxed)).count();
-                let q1: usize = q1_gauges.iter().map(|g| g.len.load(Ordering::Relaxed)).sum();
-                print!(
-                    "\rfeeds={}{}  q1={}  q2={}  accepted={}  records={}{}   ",
-                    n_feeds,
-                    if stale_feeds > 0 { " [STALE]" } else { "" },
-                    q1,
-                    q2_gauge.len.load(Ordering::Relaxed),
-                    live.accepted.load(Ordering::Relaxed),
-                    live.records.load(Ordering::Relaxed),
-                    if stale_syms > 0 { "  [symbols STALE]" } else { "" }
-                );
-                use std::io::Write;
-                std::io::stdout().flush().ok();
-                thread::sleep(Duration::from_millis(500));
+            // Progress line from main; the stages never touch stdout. On a
+            // terminal: a \r line twice a second. Redirected to a log: one
+            // timestamped line per status_interval_s.
+            let tty = std::io::stdout().is_terminal();
+            let status_every = if tty { Duration::from_millis(500) } else { Duration::from_secs(cfg.status_interval_s) };
+            let mut next_status = Instant::now();
+            while running.load(Ordering::Relaxed) && deadline.is_none_or(|d| Instant::now() < d) {
+                if Instant::now() >= next_status {
+                    print_status(&live, &q1_gauges, &q2_gauge, n_feeds, tty);
+                    next_status = Instant::now() + status_every;
+                }
+                thread::sleep(Duration::from_millis(200));
             }
 
             // Shutdown cascades: each reader drops its sender -> parser exits
@@ -257,15 +268,15 @@ fn run() -> i32 {
         });
 
     println!("\ndone.");
-    let (records, raw_lines, persist_ok) = match &persist_result {
-        Ok(r) => (r.records, r.raw_lines, true),
+    let (records, raw_lines, files, persist_ok) = match persist_result {
+        Ok(r) => (r.records, r.raw_lines, r.files, true),
         Err(e) => {
             eprintln!("[l2-persist] fatal: {e}");
-            (0, 0, false)
+            (0, 0, Vec::new(), false)
         }
     };
     let q1_peak = q1_gauges.iter().map(|g| g.peak.load(Ordering::Relaxed)).max().unwrap_or(0);
-    print_summary(&cfg, &reader_stats, &parse_stats, records, raw_lines, q1_peak, q2_gauge.peak.load(Ordering::Relaxed));
+    print_summary(&cfg, &reader_stats, &parse_stats, records, raw_lines, &files, q1_peak, q2_gauge.peak.load(Ordering::Relaxed));
 
     if persist_ok {
         0
@@ -274,7 +285,61 @@ fn run() -> i32 {
     }
 }
 
-fn print_summary(cfg: &Config, rs: &[ReaderStats], ps: &ParseStats, records: usize, raw_lines: usize, q1_peak: usize, q2_peak: usize) {
+fn print_status(live: &Live, q1_gauges: &[Arc<QueueGauge>], q2_gauge: &QueueGauge, n_feeds: usize, tty: bool) {
+    let stale_feeds = live.feed_stale.iter().filter(|f| f.load(Ordering::Relaxed)).count();
+    let down_feeds = live.feed_down.iter().filter(|f| f.load(Ordering::Relaxed)).count();
+    let stale_syms = live.symbol_stale.iter().filter(|f| f.load(Ordering::Relaxed)).count();
+    let q1: usize = q1_gauges.iter().map(|g| g.len.load(Ordering::Relaxed)).sum();
+    let body = format!(
+        "feeds={}/{}{}{}  q1={}  q2={}  accepted={}  records={}  reconnects={}  files={}{}",
+        n_feeds - down_feeds,
+        n_feeds,
+        if down_feeds > 0 { " [DOWN]" } else { "" },
+        if stale_feeds > 0 { " [STALE]" } else { "" },
+        q1,
+        q2_gauge.len.load(Ordering::Relaxed),
+        live.accepted.load(Ordering::Relaxed),
+        live.records.load(Ordering::Relaxed),
+        live.reconnects.load(Ordering::Relaxed),
+        live.files.load(Ordering::Relaxed),
+        if stale_syms > 0 { "  [symbols STALE]" } else { "" }
+    );
+    if tty {
+        print!("\r{body}   ");
+    } else {
+        println!("{} {body}", utc_stamp(wall_us()));
+    }
+    std::io::stdout().flush().ok();
+}
+
+fn print_reservoir(label: &str, r: &Reservoir, indent: &str) {
+    if r.is_empty() {
+        return;
+    }
+    let p = r.percentiles();
+    println!(
+        "{indent}{label}: n={}{} min={} p50={} p90={} p99={} max={} us",
+        p.n,
+        if r.is_estimated() { format!(" (est. from {} samples)", r.sampled()) } else { String::new() },
+        p.min,
+        p.p50,
+        p.p90,
+        p.p99,
+        p.max
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_summary(
+    cfg: &Config,
+    rs: &[ReaderStats],
+    ps: &ParseStats,
+    records: usize,
+    raw_lines: usize,
+    files: &[String],
+    q1_peak: usize,
+    q2_peak: usize,
+) {
     println!("\n=== Feeds ({}) ===", rs.len());
     for (i, r) in rs.iter().enumerate() {
         let a = &ps.feeds[i];
@@ -286,8 +351,14 @@ fn print_summary(cfg: &Config, rs: &[ReaderStats], ps: &ParseStats, records: usi
             a.accepted,
             a.dups,
             a.misordered,
-            if r.dropped { "  [DROPPED]" } else { "" }
+            if r.connected { "" } else { "  [DOWN at exit]" }
         );
+        if r.disconnects + r.rotations + r.connect_failures > 0 {
+            println!(
+                "      connections: {} unplanned disconnect(s), {} planned rotation(s), {} failed connect attempt(s)",
+                r.disconnects, r.rotations, r.connect_failures
+            );
+        }
         if r.stale.episodes > 0 {
             println!(
                 "      STALE: {} episode(s), total {} ms, longest {} ms{}",
@@ -297,20 +368,8 @@ fn print_summary(cfg: &Config, rs: &[ReaderStats], ps: &ParseStats, records: usi
                 if r.stale.stale { " (stale at exit)" } else { "" }
             );
         }
-        if !r.rtts_us.is_empty() {
-            let p = percentiles(&r.rtts_us);
-            println!(
-                "      PING/PONG RTT: n={} min={} p50={} p90={} p99={} max={} us",
-                p.n, p.min, p.p50, p.p90, p.p99, p.max
-            );
-        }
-        if !a.dup_lag_us.is_empty() {
-            let p = percentiles(&a.dup_lag_us);
-            println!(
-                "      lag behind winning feed (dups): n={} min={} p50={} p90={} p99={} max={} us",
-                p.n, p.min, p.p50, p.p90, p.p99, p.max
-            );
-        }
+        print_reservoir("PING/PONG RTT", &r.rtts, "      ");
+        print_reservoir("lag behind winning feed (dups)", &a.dup_lag, "      ");
     }
 
     println!("\n=== Pipeline ===");
@@ -337,12 +396,10 @@ fn print_summary(cfg: &Config, rs: &[ReaderStats], ps: &ParseStats, records: usi
         println!();
     }
     println!("  stale threshold: {} ms", cfg.stale_after_ms);
-    println!(
-        "  records   : {} written -> {} ({} bytes/rec)",
-        records,
-        cfg.out,
-        std::mem::size_of::<Record>()
-    );
+    println!("  records   : {} written ({} bytes/rec) in {} file(s)", records, std::mem::size_of::<Record>(), files.len());
+    for f in files {
+        println!("              {f}");
+    }
     if !cfg.raw_out.is_empty() {
         println!("  raw lines : {} -> {}", raw_lines, cfg.raw_out);
     }
@@ -357,10 +414,11 @@ fn print_summary(cfg: &Config, rs: &[ReaderStats], ps: &ParseStats, records: usi
         if cfg.pin_cpus.is_empty() { "" } else { ", pinned" }
     );
 
-    println!("\n--- Latency (recv - exchange T/E, microseconds; skew-contaminated) ---");
-    print_pcts(&percentiles(&ps.latencies_us), false, "  ");
-    println!("\n--- Inter-arrival jitter (recv_dt - exch_dt, skew-free) ---");
-    let j = percentiles(&ps.jitters_us);
+    let est = |r: &Reservoir| if r.is_estimated() { format!(" [estimated from {} of {} samples]", r.sampled(), r.total()) } else { String::new() };
+    println!("\n--- Latency (recv - exchange T/E, microseconds; skew-contaminated){} ---", est(&ps.latencies));
+    print_pcts(&ps.latencies.percentiles(), false, "  ");
+    println!("\n--- Inter-arrival jitter (recv_dt - exch_dt, skew-free){} ---", est(&ps.jitters));
+    let j = ps.jitters.percentiles();
     print_pcts(&j, true, "  ");
     if j.n > 0 {
         println!("  spread (p99 - p1): {} us", j.p99 - j.p1);

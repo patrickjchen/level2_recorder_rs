@@ -28,6 +28,7 @@ pub struct ParseStage<'a> {
     pub running: &'a AtomicBool,
     pub live: &'a Live,
     pub stale_after_us: i64,
+    pub max_samples: usize,
 }
 
 impl<'a> ParseStage<'a> {
@@ -35,7 +36,7 @@ impl<'a> ParseStage<'a> {
         let n_feeds = self.inputs.len();
         let parser = Parser::new(self.symbols);
         let mut dedup = Deduper::new(self.symbols.len());
-        let mut st = ParseStats::new(n_feeds, self.symbols.len());
+        let mut st = ParseStats::new(n_feeds, self.symbols.len(), self.max_samples);
         let mut m = ParsedMsg::default();
 
         let t0 = steady_us();
@@ -55,7 +56,7 @@ impl<'a> ParseStage<'a> {
                 match q.peek() {
                     Some(h) => {
                         all_closed = false;
-                        if best.map_or(true, |(_, ts)| h.recv_ts_us < ts) {
+                        if best.is_none_or(|(_, ts)| h.recv_ts_us < ts) {
                             best = Some((i, h.recv_ts_us));
                         }
                     }
@@ -96,7 +97,7 @@ impl<'a> ParseStage<'a> {
             if !v.accepted {
                 st.feeds[ep].dups += 1;
                 if let Some(lag) = v.dup_lag_us {
-                    st.feeds[ep].dup_lag_us.push(lag);
+                    st.feeds[ep].dup_lag.push(lag);
                     if lag < 0 {
                         st.feeds[ep].misordered += 1;
                     }
