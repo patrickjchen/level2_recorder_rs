@@ -77,7 +77,7 @@ pub fn write_csv_row(w: &mut impl Write, sym: &str, rec: &Record) -> io::Result<
 pub fn write_csv<R: Read>(reader: &mut L2binReader<R>, w: &mut impl Write, limit: Option<u64>) -> io::Result<u64> {
     writeln!(w, "{CSV_HEADER}")?;
     let mut n = 0u64;
-    while limit.map_or(true, |l| n < l) {
+    while limit.is_none_or(|l| n < l) {
         let Some(rec) = reader.next_record() else { break };
         write_csv_row(w, reader.symbol(rec.symbol_id), &rec)?;
         n += 1;

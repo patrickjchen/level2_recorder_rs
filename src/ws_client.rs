@@ -18,7 +18,7 @@ pub struct WsClient {
     sock: WebSocket<MaybeTlsStream<TcpStream>>,
     url: String,
     pending_ping_send_us: i64,
-    rtts_us: Vec<i64>,
+    last_rtt_us: Option<i64>,
 }
 
 /// Host and port from "wss://host[:port]/path" (443 default for wss).
@@ -50,7 +50,7 @@ impl WsClient {
         tcp.set_read_timeout(Some(connect_timeout)).ok();
         tcp.set_write_timeout(Some(connect_timeout)).ok();
         let (sock, _resp) = tungstenite::client_tls(url, tcp).map_err(|e| format!("websocket handshake failed: {e}"))?;
-        let mut c = WsClient { sock, url: url.to_string(), pending_ping_send_us: 0, rtts_us: Vec::new() };
+        let mut c = WsClient { sock, url: url.to_string(), pending_ping_send_us: 0, last_rtt_us: None };
         c.with_tcp(|t| {
             t.set_write_timeout(None).ok();
         });
@@ -95,7 +95,7 @@ impl WsClient {
                 }
                 Ok(Message::Pong(_)) => {
                     if self.pending_ping_send_us != 0 {
-                        self.rtts_us.push(wall_us() - self.pending_ping_send_us);
+                        self.last_rtt_us = Some(wall_us() - self.pending_ping_send_us);
                         self.pending_ping_send_us = 0;
                     }
                 }
@@ -124,7 +124,15 @@ impl WsClient {
     pub fn url(&self) -> &str {
         &self.url
     }
-    pub fn take_rtts(&mut self) -> Vec<i64> {
-        std::mem::take(&mut self.rtts_us)
+
+    /// RTT of the most recent completed PING/PONG, once.
+    pub fn take_rtt(&mut self) -> Option<i64> {
+        self.last_rtt_us.take()
+    }
+
+    /// Best-effort CLOSE frame before the socket is dropped (planned rotation).
+    pub fn close(mut self) {
+        let _ = self.sock.close(None);
+        let _ = self.sock.flush();
     }
 }

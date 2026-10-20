@@ -7,11 +7,18 @@
   ],
   "max_endpoints": 2,
   "symbols": ["btcusdt", "ethusdt"],
-  "duration_s": 60,
+  "duration_s": 0,
   "out": "data/market_data.l2bin",
   "raw_out": "",
   "queue_capacity": 65536,
   "ping_interval_ms": 1000,
   "connect_timeout_s": 10,
-  "stale_after_ms": 5000
+  "stale_after_ms": 5000,
+  "reconnect_after_s": 82800,
+  "reconnect_stagger_s": 300,
+  "reconnect_backoff_max_s": 30,
+  "rotate_s": 86400,
+  "flush_interval_ms": 1000,
+  "status_interval_s": 30,
+  "max_samples": 1048576
 }
